@@ -10,23 +10,35 @@ open Shared
 open System
 
 /// Status of the websocket.
-type ConnectionState = DisconnectedFromServer | ConnectedToServer | Connecting
+type WsSender = WebSocketClientMessage -> unit
+type BroadcastMode = ViaWebSocket | ViaHTTP
+type ConnectionState =
+    | DisconnectedFromServer | ConnectedToServer of WsSender | Connecting
+    member this.IsConnected =
+        match this with
+        | ConnectedToServer _ -> true
+        | DisconnectedFromServer | Connecting -> false
 
 type Model =
     { MessageToSend : string
-      ReceivedMessage : string
+      ReceivedMessages : {| Time : DateTime; Message : string |} list
       ConnectionState : ConnectionState }
 
 type Msg =
-    | ReceivedFromServer of WebSocketMessage
+    | ReceivedFromServer of WebSocketServerMessage
     | ConnectionChange of ConnectionState
     | MessageChanged of string
-    | Broadcast of string
+    | Broadcast of BroadcastMode * string
 
 module Channel =
     open Browser.WebSocket
 
     let inline decode<'a> x = x |> unbox<string> |> Thoth.Json.Decode.Auto.unsafeFromString<'a>
+    let buildWsSender (ws:WebSocket) : WsSender =
+        fun (message:WebSocketClientMessage) ->
+            let message = {| Topic = ""; Ref = ""; Payload = message |}
+            let message = Thoth.Json.Encode.Auto.toString(0, message)
+            ws.send message
 
     let subscription _ =
         let sub dispatch =
@@ -34,7 +46,7 @@ module Channel =
             let onWebSocketMessage (msg:MessageEvent) =
                 let msg = msg.data |> decode<{| Payload : string |}>
                 msg.Payload
-                |> decode<WebSocketMessage>
+                |> decode<WebSocketServerMessage>
                 |> ReceivedFromServer
                 |> dispatch
 
@@ -43,7 +55,7 @@ module Channel =
                 let ws = WebSocket.Create "ws://localhost:8085/channel"
                 ws.onmessage <- onWebSocketMessage
                 ws.onopen <- (fun ev ->
-                    dispatch (ConnectionChange ConnectedToServer)
+                    dispatch (ConnectionChange (ConnectedToServer (buildWsSender ws)))
                     printfn "WebSocket opened")
                 ws.onclose <- (fun ev ->
                     dispatch (ConnectionChange DisconnectedFromServer)
@@ -60,7 +72,7 @@ module Channel =
 let init () =
     { MessageToSend = null
       ConnectionState = DisconnectedFromServer
-      ReceivedMessage = null }, Cmd.none
+      ReceivedMessages = [] }, Cmd.none
 
 let update msg model : Model * Cmd<Msg> =
     match msg with
@@ -68,11 +80,16 @@ let update msg model : Model * Cmd<Msg> =
         { model with MessageToSend = msg }, Cmd.none
     | ConnectionChange status ->
         { model with ConnectionState = status }, Cmd.none
-    | ReceivedFromServer (BroadcastMessage msg) ->
-        { model with ReceivedMessage = sprintf "Broadcast from a client: '%s'" msg }, Cmd.none
-    | Broadcast msg ->
-        let res = Cmd.OfPromise.result (Fetch.post("/api/broadcast", msg))
-        model, res
+    | ReceivedFromServer (BroadcastMessage message) ->
+        { model with ReceivedMessages = message :: model.ReceivedMessages }, Cmd.none
+    | Broadcast (ViaWebSocket, msg) ->
+        match model.ConnectionState with
+        | ConnectedToServer sender -> sender (TextMessage msg)
+        | _ -> ()
+        model, Cmd.none
+    | Broadcast (ViaHTTP, msg) ->
+        let post = Fetch.post("/api/broadcast", msg)
+        model, Cmd.OfPromise.result post
 
 module ViewParts =
     let drawStatus connectionState =
@@ -81,12 +98,12 @@ module ViewParts =
                 (match connectionState with
                  | DisconnectedFromServer -> Color.IsDanger
                  | Connecting -> Color.IsWarning
-                 | ConnectedToServer -> Color.IsSuccess)
+                 | ConnectedToServer _ -> Color.IsSuccess)
         ] [
             match connectionState with
             | DisconnectedFromServer -> str "Disconnected from server"
             | Connecting -> str "Connecting..."
-            | ConnectedToServer -> str "Connected to server"
+            | ConnectedToServer _ -> str "Connected to server"
         ]
 
 
@@ -94,7 +111,7 @@ let view (model : Model) (dispatch : Msg -> unit) =
     div [] [
         Navbar.navbar [ Navbar.Color IsPrimary ] [
             Navbar.Item.div [ ] [
-                Heading.h2 [ ] [ str "SAFE Reactive Template" ]
+                Heading.h2 [ ] [ str "SAFE Channels Template" ]
             ]
         ]
         Container.container [] [
@@ -102,18 +119,34 @@ let view (model : Model) (dispatch : Msg -> unit) =
                 Heading.h3 [] [ str "Send a message!" ]
                 Input.text [ Input.OnChange(fun e -> dispatch(MessageChanged e.Value)) ]
             ]
-            Button.button
-                [ Button.IsFullWidth
-                  Button.Color IsPrimary
-                  Button.Disabled (String.IsNullOrEmpty model.MessageToSend || model.ConnectionState <> ConnectedToServer)
-                  Button.OnClick (fun _ -> dispatch (Broadcast model.MessageToSend)) ]
-                [ str "Click to broadcast!" ]
+            Columns.columns [] [
+                for broadcastMethod in [ ViaHTTP; ViaWebSocket ] do
+                    Column.column [] [
+                        Button.button
+                            [ Button.IsFullWidth
+                              Button.Color IsPrimary
+                              Button.Disabled (String.IsNullOrEmpty model.MessageToSend || not model.ConnectionState.IsConnected)
+                              Button.OnClick (fun _ -> dispatch (Broadcast (broadcastMethod, model.MessageToSend))) ]
+                            [ str (sprintf "Click to broadcast %O!" broadcastMethod) ]
+                    ]
+            ]
 
             ViewParts.drawStatus model.ConnectionState
 
-            if not (String.IsNullOrEmpty model.ReceivedMessage) then
-                Heading.h4 [ Heading.IsSubtitle ] [
-                    str (sprintf "Received from server: %s" model.ReceivedMessage)
+            match model.ReceivedMessages with
+            | [] ->
+                ()
+            | messages ->
+                Table.table [] [
+                    thead [] [
+                        td [] [ str "Time" ]
+                        td [] [ str "Message" ]
+                    ]
+                    for message in messages do
+                        tr [] [
+                            td [] [ str (sprintf "%O" message.Time) ]
+                            td [] [ str message.Message ]
+                        ]
                 ]
         ]
         Footer.footer [ ] [
