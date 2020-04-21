@@ -4,6 +4,7 @@ open Elmish
 open Elmish.React
 open Fable.React
 open Thoth.Fetch
+open Thoth.Json
 open Fulma
 open Browser.Types
 open Shared
@@ -139,14 +140,19 @@ let view (model : Model) (dispatch : Msg -> unit) =
             | messages ->
                 Table.table [] [
                     thead [] [
-                        td [] [ str "Time" ]
-                        td [] [ str "Message" ]
-                    ]
-                    for message in messages do
                         tr [] [
-                            td [] [ str (sprintf "%O" message.Time) ]
-                            td [] [ str message.Message ]
+                            td [] [ str "Time" ]
+                            td [] [ str "Message" ]
                         ]
+                    ]
+                    tbody [][
+                        for message in messages do
+                            tr [] [
+                                td [] [ str (sprintf "%O" message.Time) ]
+                                td [] [ str message.Message ]
+                            ]
+                    ]
+                    tfoot [] []
                 ]
         ]
         Footer.footer [ ] [
@@ -156,6 +162,23 @@ let view (model : Model) (dispatch : Msg -> unit) =
         ]
     ]
 
+module CustomEncoders =
+
+    let inline addDummyCoder<'b> extrasIn =
+        let typeName = string typeof<'b>
+        let simpleEncoder(_ : 'b) = Encode.string (sprintf "%s function" typeName)
+        let simpleDecoder = Decode.fail (sprintf "Decoding is not supported for %s type" typeName)
+        extrasIn |> Extra.withCustom simpleEncoder simpleDecoder
+        
+    let inline buildExtras<'a> extraCoders =
+        let myEncoder:Encoder<'a> = Encode.Auto.generateEncoder(extra = extraCoders)
+        let myDecoder:Decoder<'a> = Decode.Auto.generateDecoder(extra = extraCoders)
+        (myEncoder, myDecoder)
+
+let extras = Extra.empty
+                |> CustomEncoders.addDummyCoder<WsSender>
+                |> CustomEncoders.buildExtras<Model>
+
 open Elmish.Debug
 open Elmish.HMR
 
@@ -163,5 +186,5 @@ Program.mkProgram init update view
 |> Program.withConsoleTrace
 |> Program.withSubscription Channel.subscription
 |> Program.withReactSynchronous "elmish-app"
-|> Program.withDebugger
+|> Program.withDebuggerCoders (fst extras) (snd extras)
 |> Program.run
